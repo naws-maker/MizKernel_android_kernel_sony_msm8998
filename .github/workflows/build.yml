@@ -38,31 +38,36 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          # submodules НЕ включаем: в дереве битый gitlink "BakaSU" без url в .gitmodules,
-          # из-за него git submodule update падает. KernelSU-Next клонируем вручную ниже.
+          # submodules НЕ включаем: в .gitmodules нет записи для gitlink "BakaSU",
+          # из-за чего git submodule update падает. BakaSU клонируем вручную ниже.
           submodules: false
 
-      - name: Get KernelSU-Next (ветка legacy, закреплённый коммит)
+      - name: Get BakaSU (KernelSU fork, закреплённый коммит)
         run: |
           set -e
-          rm -rf BakaSU
-          rm -rf KernelSU-Next
-          git clone --branch legacy --single-branch https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
-          cd KernelSU-Next
-          git checkout 3ab98d0d8ef5163f5bd31cbe522fdb87763b300b || {
-            echo "::warning::закреплённый коммит недоступен, берём tip ветки legacy"
-            git checkout legacy
+          rm -rf BakaSU KernelSU-Next
+          # полный клон: Kbuild BakaSU считает версию через git rev-list/describe
+          git clone https://github.com/Baka-SU/BakaSU BakaSU
+          cd BakaSU
+          git checkout f4435f007b16f61705089ff982e3f981a6017979 || {
+            echo "::warning::закреплённый коммит недоступен, берём tip main"
+            git checkout main
           }
           test -f kernel/Kconfig
-          echo "KernelSU-Next OK: $(git log -1 --oneline)"
+          echo "BakaSU OK: $(git log -1 --oneline)"
 
-      - name: Fix KernelSU symlink (в дереве он абсолютный /workspaces/... и сломан)
+      - name: Fix kernelsu symlink (в дереве он абсолютный /workspaces/... и сломан)
         run: |
           set -e
           rm -f drivers/kernelsu
-          ln -s ../KernelSU-Next/kernel drivers/kernelsu
+          ln -s ../BakaSU/kernel drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
           echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
+
+      - name: Patch kernel source for BakaSU manual hooks
+        run: |
+          set -e
+          python3 scripts/patch_ksu.py
 
       - name: Install packages
         run: |
@@ -96,19 +101,26 @@ jobs:
           ld.lld --version | head -1
           aarch64-linux-gnu-gcc --version | head -1
 
-      - name: defconfig + KernelSU
+      - name: defconfig + BakaSU
         run: |
           set -e
           echo "Defconfig: $DEFCONFIG"
           make $MAKE_ARGS "$DEFCONFIG"
-          # Ядро 4.4: KSU_KPROBES_HOOK нельзя (только >=5.10),
-          # KSU_SYSCALL_TABLE_HOOK нельзя (>=4.17) -> только MANUAL_HOOK.
-          printf 'CONFIG_KSU=y\nCONFIG_KSU_MANUAL_HOOK=y\n' >> out/.config
+          # Ядро 4.4: нужен только MANUAL_HOOK (у BakaSU ручные хуки уже в дереве).
+          # AUTO_* отключаем, чтобы хуки не срабатывали дважды (LSM + ручной вызов).
+          printf '%s\n' \
+            'CONFIG_KSU=y' \
+            'CONFIG_KSU_MANUAL_HOOK=y' \
+            'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' \
+            '# CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK is not set' \
+            '# CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK is not set' \
+            '# CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK is not set' >> out/.config
           make $MAKE_ARGS olddefconfig
           echo "--- проверка опций ---"
-          grep -E '^CONFIG_KSU=|^CONFIG_KSU_MANUAL_HOOK=|^CONFIG_KSU_KPROBES_HOOK=|^CONFIG_KSU_SYSCALL_TABLE_HOOK=|^CONFIG_MACH_SONY_' out/.config
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU_MANUAL_HOOK_AUTO' out/.config
           grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU не включился"; exit 1; }
           grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "::error::CONFIG_KSU_MANUAL_HOOK не включился"; exit 1; }
+          grep -q '^CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' out/.config || { echo "::error::CONFIG_KSU_MULTI_MANAGER_SUPPORT не включился"; exit 1; }
 
       - name: Build kernel
         run: |
