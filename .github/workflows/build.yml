@@ -38,18 +38,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          submodules: recursive
+          # submodules НЕ включаем: в дереве битый gitlink "BakaSU" без url в .gitmodules,
+          # из-за него git submodule update падает. KernelSU-Next клонируем вручную ниже.
+          submodules: false
 
-      - name: Ensure KernelSU-Next submodule is present
+      - name: Get KernelSU-Next (ветка legacy, закреплённый коммит)
         run: |
           set -e
-          if [ ! -f KernelSU-Next/kernel/Kconfig ]; then
-            echo "::warning::сабмодуль не распаковался, клонируем вручную (ветка legacy)"
-            rm -rf KernelSU-Next
-            git clone --depth 1 --branch legacy https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
-          fi
-          test -f KernelSU-Next/kernel/Kconfig
-          echo "KernelSU-Next OK: $(git -C KernelSU-Next log -1 --oneline 2>/dev/null || echo '?')"
+          rm -rf BakaSU
+          rm -rf KernelSU-Next
+          git clone --branch legacy --single-branch https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
+          cd KernelSU-Next
+          git checkout 3ab98d0d8ef5163f5bd31cbe522fdb87763b300b || {
+            echo "::warning::закреплённый коммит недоступен, берём tip ветки legacy"
+            git checkout legacy
+          }
+          test -f kernel/Kconfig
+          echo "KernelSU-Next OK: $(git log -1 --oneline)"
 
       - name: Fix KernelSU symlink (в дереве он абсолютный /workspaces/... и сломан)
         run: |
