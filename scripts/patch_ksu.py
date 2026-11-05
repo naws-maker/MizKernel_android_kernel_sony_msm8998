@@ -126,4 +126,13 @@ patch_file(
     ],
 )
 
+# -------------------------------------------- security/selinux/ss/services.c
+patch_file(
+    "security/selinux/ss/services.c",
+    [
+        ("is_ksu_transition extern", SELINUX_EXTERN, "", 1),
+        ("is_ksu_transition use", SELINUX_USE, "", 1),
+    ],
+)
+
 print("all BakaSU manual-hook patches applied")
