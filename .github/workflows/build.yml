@@ -1,0 +1,143 @@
+name: Build MizKernel (yoshino)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Устройство (суффикс defconfig lineage-msm8998-yoshino-*)"
+        type: choice
+        default: poplar_dsds
+        options:
+          - poplar_dsds   # Xperia XZ1 Dual (G8342)
+          - poplar        # Xperia XZ1
+          - poplar_kddi   # Xperia XZ1 KDDI
+          - lilac         # Xperia XZ1 Compact
+          - lilac_dcm     # Xperia XZ1 Compact Docomo
+          - maple         # Xperia XZ Premium
+          - maple_dsds    # Xperia XZ Premium Dual
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compile kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      TARGET: ${{ inputs.target }}
+      DEFCONFIG: lineage-msm8998-yoshino-${{ inputs.target }}_defconfig
+      MAKE_ARGS: >-
+        O=out ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+        CLANG_TRIPLE=aarch64-linux-gnu-
+        CROSS_COMPILE=aarch64-linux-gnu-
+        CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+    steps:
+      - name: Checkout kernel tree
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Ensure KernelSU-Next submodule is present
+        run: |
+          set -e
+          if [ ! -f KernelSU-Next/kernel/Kconfig ]; then
+            echo "::warning::сабмодуль не распаковался, клонируем вручную (ветка legacy)"
+            rm -rf KernelSU-Next
+            git clone --depth 1 --branch legacy https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
+          fi
+          test -f KernelSU-Next/kernel/Kconfig
+          echo "KernelSU-Next OK: $(git -C KernelSU-Next log -1 --oneline 2>/dev/null || echo '?')"
+
+      - name: Fix KernelSU symlink (в дереве он абсолютный /workspaces/... и сломан)
+        run: |
+          set -e
+          rm -f drivers/kernelsu
+          ln -s ../KernelSU-Next/kernel drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+          echo "drivers/kernelsu -> $(readlink drivers/kernelsu)"
+
+      - name: Install packages
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            cpio kmod rsync python3 zip unzip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
+      - name: Setup clang r547379 (AOSP prebuilt)
+        run: |
+          set -e
+          mkdir -p toolchains
+          curl -L --retry 3 --retry-delay 2 -o clang-r547379.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz"
+          tar -xf clang-r547379.tar.gz -C toolchains/
+          if [ -x toolchains/clang-r547379/bin/clang ]; then
+            CLANG_DIR="$PWD/toolchains/clang-r547379"
+          elif [ -x toolchains/bin/clang ]; then
+            CLANG_DIR="$PWD/toolchains"
+          else
+            echo "::error::clang не найден после распаковки"
+            find toolchains -maxdepth 2 | head -50
+            exit 1
+          fi
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          export PATH="$CLANG_DIR/bin:$PATH"
+          clang --version | head -2
+          ld.lld --version | head -1
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: defconfig + KernelSU
+        run: |
+          set -e
+          echo "Defconfig: $DEFCONFIG"
+          make $MAKE_ARGS "$DEFCONFIG"
+          # Ядро 4.4: KSU_KPROBES_HOOK нельзя (только >=5.10),
+          # KSU_SYSCALL_TABLE_HOOK нельзя (>=4.17) -> только MANUAL_HOOK.
+          printf 'CONFIG_KSU=y\nCONFIG_KSU_MANUAL_HOOK=y\n' >> out/.config
+          make $MAKE_ARGS olddefconfig
+          echo "--- проверка опций ---"
+          grep -E '^CONFIG_KSU=|^CONFIG_KSU_MANUAL_HOOK=|^CONFIG_KSU_KPROBES_HOOK=|^CONFIG_KSU_SYSCALL_TABLE_HOOK=|^CONFIG_MACH_SONY_' out/.config
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU не включился"; exit 1; }
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "::error::CONFIG_KSU_MANUAL_HOOK не включился"; exit 1; }
+
+      - name: Build kernel
+        run: |
+          set -e
+          make -j"$(nproc)" $MAKE_ARGS
+
+      - name: Package Image.gz-dtb
+        run: |
+          set -e
+          ls -la out/arch/arm64/boot/ || true
+          test -f out/arch/arm64/boot/Image.gz-dtb || {
+            echo "::error::Image.gz-dtb не получен"; exit 1; }
+          STAMP="$(date +%Y%m%d-%H%M)"
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image.gz-dtb "dist/Image.gz-dtb-${TARGET}-${STAMP}"
+          cp out/.config "dist/config-${TARGET}-${STAMP}.txt"
+          if find out -name '*.ko' -print -quit | grep -q .; then
+            find out -name '*.ko' | tar -czf "dist/modules-${TARGET}-${STAMP}.tar.gz" -T -
+          fi
+          {
+            echo "target        : $TARGET"
+            echo "defconfig     : $DEFCONFIG"
+            echo "kernelrelease : $(cat out/include/config/kernel.release 2>/dev/null || echo '?')"
+            echo "clang         : $(clang --version | head -1)"
+            echo "built         : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > dist/BUILD_INFO.txt
+          echo "--- KSU в собранном конфиге ---"
+          grep -E '^CONFIG_KSU' out/.config || true
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MizKernel-${{ inputs.target }}-Image.gz-dtb
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
